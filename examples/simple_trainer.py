@@ -2,8 +2,8 @@ import json
 import math
 import os
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import imageio
@@ -17,25 +17,30 @@ import viser
 import yaml
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
-    generate_ellipse_path_z,
     generate_interpolated_path,
+    generate_ellipse_path_z,
     generate_spiral_path,
 )
-from fused_ssim import fused_ssim
-from lib_bilagrid import BilateralGrid, color_correct, slice, total_variation_loss
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from fused_ssim import fused_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from lib_bilagrid import (
+    BilateralGrid,
+    slice,
+    color_correct,
+    total_variation_loss,
+)
 
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
-from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.optimizers import SelectiveAdam
 from gsplat.utils import save_ply
 
 
@@ -85,8 +90,6 @@ class Config:
     save_ply: bool = False
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
-    # Whether to disable video generation during training and evaluation
-    disable_video: bool = False
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -162,6 +165,12 @@ class Config:
     # Dump information to tensorboard every this steps
     tb_every: int = 100
     # Save training images to tensorboard
+
+    ##############################################################################
+    # Add fluid label loss
+    label_loss_lambda: float = 1.0
+    ##############################################################################
+
     tb_save_image: bool = False
 
     lpips_net: Literal["vgg", "alex"] = "alex"
@@ -233,6 +242,10 @@ def create_splats_with_optimizers(
         ("scales", torch.nn.Parameter(scales), 5e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
+        ##############################################################################
+        # Add fluid label
+        ("labels", torch.nn.Parameter(torch.zeros((N, 1))), 1e-3),
+        ##############################################################################
     ]
 
     if feature_dim is None:
@@ -674,10 +687,43 @@ class Runner:
                     loss
                     + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                 )
+            ##############################################################################
+            # Add label loss
+            N_splats = self.splats["means"].shape[0]
+            ones = torch.ones((N_splats, 1), device=device)
+            # Concatenating homogeneous coordinates
+            splats_h = torch.cat([self.splats["means"], ones], dim=1)  # [N, 4]
+            # Calculate the view matrix using the current image's perspective
+            view_matrix = torch.linalg.inv(camtoworlds[0])
+            splats_cam = (view_matrix @ splats_h.T).T  # [N, 4]
+            valid = splats_cam[:, 2] > 0  # Only front point valid
+            if valid.sum() > 0:
+                K_single = Ks[0]
+                # Calculate the projection
+                u = (K_single[0, 0] * splats_cam[valid, 0] / splats_cam[valid, 2]) + K_single[0, 2]
+                v = (K_single[1, 1] * splats_cam[valid, 1] / splats_cam[valid, 2]) + K_single[1, 2]
+                norm_x = 2 * u / (width - 1) - 1
+                norm_y = 2 * v / (height - 1) - 1
+                # Construct sample grid: [1, valid_count, 1, 2]
+                grid = torch.stack([norm_x, norm_y], dim=1).unsqueeze(0).unsqueeze(2)
+
+                mask_sample = F.grid_sample(masks.unsqueeze(1).float(), grid, mode='nearest', align_corners=True)
+                target_labels = mask_sample.view(-1)
+                # Get corresponding predict label legit
+                pred_logits = self.splats["labels"][valid].view(-1)
+                label_loss = F.binary_cross_entropy_with_logits(pred_logits, target_labels)
+            else:
+                label_loss = torch.tensor(0.0, device=device)
+
+            # Add label loss to the main loss
+            loss = loss + cfg.label_loss_lambda * label_loss
+
+            desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| label loss={label_loss.item():.6f}| "
+            ##############################################################################
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| label loss={label_loss.item():.6f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -741,8 +787,10 @@ class Runner:
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
             if (
-                step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
-            ) and cfg.save_ply:
+                step in [i - 1 for i in cfg.ply_steps]
+                or step == max_steps - 1
+                and cfg.save_ply
+            ):
                 rgb = None
                 if self.cfg.app_opt:
                     # eval at origin to bake the appeareance into the colors
@@ -780,7 +828,7 @@ class Runner:
                     )
                     visibility_mask.scatter_(0, info["gaussian_ids"], 1)
                 else:
-                    visibility_mask = (info["radii"] > 0).all(-1).any(0)
+                    visibility_mask = (info["radii"] > 0).any(0)
 
             # optimize
             for optimizer in self.optimizers.values():
@@ -826,7 +874,7 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
-                self.render_traj(step)
+                # self.render_traj(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -927,8 +975,6 @@ class Runner:
     @torch.no_grad()
     def render_traj(self, step: int):
         """Entry for trajectory rendering."""
-        if self.cfg.disable_video:
-            return
         print("Running trajectory rendering...")
         cfg = self.cfg
         device = self.device
@@ -1015,25 +1061,71 @@ class Runner:
             self.splats[k].data = splats_c[k].to(self.device)
         self.eval(step=step, stage="compress")
 
+    # @torch.no_grad()
+    # def _viewer_render_fn(
+    #     self, camera_state: nerfview.CameraState, img_wh: Tuple[int, int]
+    # ):
+    #     """Callable function for the viewer."""
+    #     W, H = img_wh
+    #     c2w = camera_state.c2w
+    #     K = camera_state.get_K(img_wh)
+    #     c2w = torch.from_numpy(c2w).float().to(self.device)
+    #     K = torch.from_numpy(K).float().to(self.device)
+    #
+    #     render_colors, _, _ = self.rasterize_splats(
+    #         camtoworlds=c2w[None],
+    #         Ks=K[None],
+    #         width=W,
+    #         height=H,
+    #         sh_degree=self.cfg.sh_degree,  # active all SH degrees
+    #         radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
+    #     )  # [1, H, W, 3]
+    #     return render_colors[0].cpu().numpy()
     @torch.no_grad()
     def _viewer_render_fn(
-        self, camera_state: nerfview.CameraState, img_wh: Tuple[int, int]
+            self, camera_state: nerfview.CameraState, img_wh: Tuple[int, int]
     ):
-        """Callable function for the viewer."""
         W, H = img_wh
         c2w = camera_state.c2w
         K = camera_state.get_K(img_wh)
         c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
 
+        if "labels" in self.splats:
+            if self.cfg.app_opt:
+                orig_colors = self.splats["colors"].data.clone()
+                mask = (torch.sigmoid(self.splats["labels"]) > 0.5).view(-1)
+                red_color = torch.tensor(
+                    [1.0, 0.0, 0.0],
+                    device=self.device,
+                    dtype=self.splats["colors"].data.dtype,
+                )
+                self.splats["colors"].data[mask] = red_color
+            else:
+                orig_sh0 = self.splats["sh0"].data.clone()
+                mask = (torch.sigmoid(self.splats["labels"]) > 0.5).view(-1)
+                red_color = torch.tensor(
+                    [1.0, 0.0, 0.0],
+                    device=self.device,
+                    dtype=self.splats["sh0"].data.dtype,
+                )
+                self.splats["sh0"].data[mask] = red_color.view(1, 1, 3).expand_as(self.splats["sh0"].data[mask])
+
         render_colors, _, _ = self.rasterize_splats(
             camtoworlds=c2w[None],
             Ks=K[None],
             width=W,
             height=H,
-            sh_degree=self.cfg.sh_degree,  # active all SH degrees
-            radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
-        )  # [1, H, W, 3]
+            sh_degree=self.cfg.sh_degree,
+            radius_clip=3.0,
+        )
+
+        if "labels" in self.splats:
+            if self.cfg.app_opt:
+                self.splats["colors"].data.copy_(orig_colors)
+            else:
+                self.splats["sh0"].data.copy_(orig_sh0)
+
         return render_colors[0].cpu().numpy()
 
 

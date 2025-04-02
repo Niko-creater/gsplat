@@ -362,7 +362,21 @@ class Dataset:
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
+        ##############################################################################
+        image_name = self.parser.image_names[index]
+        mask_path = os.path.join(self.parser.data_dir, "masks", image_name + ".png")
+        if os.path.exists(mask_path):
+            mask_external = imageio.imread(mask_path)
+            if mask_external.ndim == 3:
+                mask_external = mask_external[..., 0]
+        else:
+            mask_external = None
 
+        if mask_external is not None and self.parser.factor > 1:
+            image_h, image_w = image.shape[:2]
+            mask_external = cv2.resize(mask_external, (image_w, image_h), interpolation=cv2.INTER_NEAREST)
+
+        ##############################################################################
         if len(params) > 0:
             # Images are distorted. Undistort them.
             mapx, mapy = (
@@ -370,8 +384,16 @@ class Dataset:
                 self.parser.mapy_dict[camera_id],
             )
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
+
+            ##############################################################################
+            if mask_external is not None:
+                mask_external = cv2.remap(mask_external, mapx, mapy, interpolation=cv2.INTER_NEAREST)
+                mask_external = mask_external[y: y + h, x: x + w]
+                mask_external = (mask_external > 128).astype(np.uint8) * 255
+            ##############################################################################
 
         if self.patch_size is not None:
             # Random crop.
@@ -382,15 +404,24 @@ class Dataset:
             K[0, 2] -= x
             K[1, 2] -= y
 
+            ##############################################################################
+            if mask_external is not None:
+                mask_external = mask_external[y: y + self.patch_size, x: x + self.patch_size]
+                mask_external = (mask_external > 128).astype(np.uint8) * 255
+            ##############################################################################
+
         data = {
             "K": torch.from_numpy(K).float(),
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
         }
-        if mask is not None:
-            data["mask"] = torch.from_numpy(mask).bool()
-
+        ##############################################################################
+        # if mask is not None:
+        #     data["mask"] = torch.from_numpy(mask).bool()
+        if mask_external is not None:
+            data["mask"] = torch.from_numpy(mask_external).bool()
+        ##############################################################################
         if self.load_depths:
             # projected points to image plane to get depths
             worldtocams = np.linalg.inv(camtoworlds)
